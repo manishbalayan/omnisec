@@ -11,7 +11,7 @@ COPY . .
 
 RUN cargo build --release --bin chaos-agent
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     procps \
