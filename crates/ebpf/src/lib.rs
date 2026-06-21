@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 
 #[cfg(target_os = "linux")]
 use aya::{
+    include_bytes_aligned,
     maps::{MapData, RingBuf},
     programs::TracePoint,
     Ebpf,
@@ -924,27 +925,3 @@ impl Default for EbpfManager {
 
 
 
-// =========================================================================
-// Helper macro for embedding BPF bytecode (Linux only)
-// =========================================================================
-
-#[cfg(target_os = "linux")]
-macro_rules! include_bytes_aligned {
-    ($path:expr) => {{
-        // BPF bytecode must be aligned to 8 bytes
-        const ALIGN: usize = 8;
-        static BYTES: &[u8] = include_bytes!($path);
-        let len = BYTES.len();
-        let padded_len = (len + ALIGN - 1) & !(ALIGN - 1);
-        let mut padded = vec![0u8; padded_len];
-        padded[..len].copy_from_slice(BYTES);
-        padded
-    }};
-}
-
-#[cfg(not(target_os = "linux"))]
-macro_rules! include_bytes_aligned {
-    ($path:expr) => {{
-        Vec::new()
-    }};
-}
