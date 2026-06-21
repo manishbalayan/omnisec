@@ -35,10 +35,9 @@ use tracing::{debug, info, warn};
 
 #[cfg(target_os = "linux")]
 use aya::{
-    programs::{TracePoint, KProbe, XdpLink},
-    util::online_cpus,
-    maps::{MapRefMut, RingBuf},
-    Ebpf, Btf,
+    maps::{MapData, RingBuf},
+    programs::TracePoint,
+    Ebpf,
 };
 
 // =========================================================================
@@ -213,13 +212,13 @@ pub struct EbpfManager {
     using_fallback: bool,
     /// Ring buffer readers — one per CPU per map
     #[cfg(target_os = "linux")]
-    process_ring_bufs: Vec<RingBuf<MapRefMut>>,
+    process_ring_bufs: Vec<RingBuf<MapData>>,
     #[cfg(target_os = "linux")]
-    network_ring_bufs: Vec<RingBuf<MapRefMut>>,
+    network_ring_bufs: Vec<RingBuf<MapData>>,
     #[cfg(target_os = "linux")]
-    file_ring_bufs: Vec<RingBuf<MapRefMut>>,
+    file_ring_bufs: Vec<RingBuf<MapData>>,
     #[cfg(target_os = "linux")]
-    dns_ring_bufs: Vec<RingBuf<MapRefMut>>,
+    dns_ring_bufs: Vec<RingBuf<MapData>>,
     /// eBPF object
     #[cfg(target_os = "linux")]
     bpf: Option<Ebpf>,
@@ -297,9 +296,11 @@ impl EbpfManager {
                     self.loaded = true;
                     self.using_fallback = false;
 
-                    let mut stats = self.stats.write().await;
-                    stats.ebpf_loaded = true;
-                    stats.using_fallback = false;
+                    {
+                        let mut stats = self.stats.write().await;
+                        stats.ebpf_loaded = true;
+                        stats.using_fallback = false;
+                    } // drop write guard before mutably borrowing self
 
                     // Start the ring buffer reader tasks
                     self.start_ring_buffer_readers();
@@ -407,30 +408,30 @@ impl EbpfManager {
         program.attach("syscalls", "sys_enter_sendto")?;
         info!("Attached sys_enter_sendto tracepoint (DNS port 53)");
 
-        // Open the ring buffer maps
-        let process_map: MapRefMut = bpf.map_mut("PROCESS_EVENTS")?;
-        let network_map: MapRefMut = bpf.map_mut("NETWORK_EVENTS")?;
-        let file_map: MapRefMut = bpf.map_mut("FILE_EVENTS")?;
-        let dns_map: MapRefMut = bpf.map_mut("DNS_EVENTS")?;
+        // Take ring buffer maps (owned) from the loaded Ebpf object
+        let process_rb = RingBuf::<MapData>::try_from(
+            bpf.take_map("PROCESS_EVENTS")
+                .ok_or_else(|| anyhow::anyhow!("PROCESS_EVENTS map not found"))?,
+        )?;
+        self.process_ring_bufs.push(process_rb);
 
-        // Create per-CPU ring buffer readers
-        let cpus = online_cpus()?;
-        for cpu in cpus {
-            let rb = RingBuf::try_from(process_map.try_clone()?)?;
-            self.process_ring_bufs.push(rb);
-        }
-        for cpu in cpus.clone() {
-            let rb = RingBuf::try_from(network_map.try_clone()?)?;
-            self.network_ring_bufs.push(rb);
-        }
-        for cpu in cpus.clone() {
-            let rb = RingBuf::try_from(file_map.try_clone()?)?;
-            self.file_ring_bufs.push(rb);
-        }
-        for _cpu in cpus {
-            let rb = RingBuf::try_from(dns_map.try_clone()?)?;
-            self.dns_ring_bufs.push(rb);
-        }
+        let network_rb = RingBuf::<MapData>::try_from(
+            bpf.take_map("NETWORK_EVENTS")
+                .ok_or_else(|| anyhow::anyhow!("NETWORK_EVENTS map not found"))?,
+        )?;
+        self.network_ring_bufs.push(network_rb);
+
+        let file_rb = RingBuf::<MapData>::try_from(
+            bpf.take_map("FILE_EVENTS")
+                .ok_or_else(|| anyhow::anyhow!("FILE_EVENTS map not found"))?,
+        )?;
+        self.file_ring_bufs.push(file_rb);
+
+        let dns_rb = RingBuf::<MapData>::try_from(
+            bpf.take_map("DNS_EVENTS")
+                .ok_or_else(|| anyhow::anyhow!("DNS_EVENTS map not found"))?,
+        )?;
+        self.dns_ring_bufs.push(dns_rb);
 
         self.bpf = Some(bpf);
         Ok(())

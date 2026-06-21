@@ -37,6 +37,12 @@ fn build_bpf_programs() {
     let bpf_crate = workspace_root.join("crates").join("ebpf-bpf");
     let target_dir = workspace_root.join("target");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out_path = out_dir.join("omnisec-ebpf-bpf");
+
+    // Always write a placeholder first so include_bytes! compiles even without bpf-linker.
+    // Overwritten below if real compilation succeeds.
+    std::fs::write(&out_path, b"").expect("Failed to write BPF ELF placeholder");
+
     // Verify bpf-linker is available
     let linker_check = Command::new("which")
         .arg("bpf-linker")
@@ -110,8 +116,7 @@ fn build_bpf_programs() {
         return;
     }
 
-    // Copy to OUT_DIR so the userspace code can include it
-    let out_path = out_dir.join("omnisec-ebpf-bpf");
+    // Copy real ELF over the placeholder
     std::fs::copy(&bpf_elf, &out_path).expect("Failed to copy BPF ELF to OUT_DIR");
 
     let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
