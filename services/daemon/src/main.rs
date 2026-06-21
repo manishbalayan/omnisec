@@ -1,17 +1,17 @@
 use anyhow::Result;
 use axum::{Json, Router};
-use omnisec_alerts::{AlertConfig, AlertManager};
 use chrono::{Timelike, Utc};
+use omnisec_alerts::{AlertConfig, AlertManager};
 use omnisec_anomaly::AnomalyDetector;
+use omnisec_decision::{DecisionAction, DecisionEngine, EnforcementDecision};
 use omnisec_discovery::AgentDiscovery;
-use omnisec_state::StateManager;
 use omnisec_ebpf::{EbpfManager, KernelEvent, KernelEventStream};
+use omnisec_enforcement::EnforcementManager;
 use omnisec_events::subjects;
 use omnisec_events::{
-    AgentDiscoveredPayload, AgentFailedPayload, AgentHealthChangedPayload,
-    AlertRequestedPayload, AlertSentPayload, AlertFailedPayload,
-    HealthState,
-    RestartRequestedPayload, RestartStartedPayload, RestartSucceededPayload,
+    AgentDiscoveredPayload, AgentFailedPayload, AgentHealthChangedPayload, AlertFailedPayload,
+    AlertRequestedPayload, AlertSentPayload, HealthState, RestartRequestedPayload,
+    RestartStartedPayload, RestartSucceededPayload,
 };
 use omnisec_fingerprint::FingerprintManager;
 use omnisec_identity::AgentIdentityEngine;
@@ -19,14 +19,14 @@ use omnisec_messaging::NatsClient;
 use omnisec_monitoring::{HealthEvent, HealthMonitor, RestartConfig, RestartEngine};
 use omnisec_network::NetworkTracker;
 use omnisec_reliability::incident::{IncidentEngine, IncidentSeverity, IncidentType};
+use omnisec_runtime::RuntimeManager;
 use omnisec_security::correlation::{AgentActivitySnapshot, CorrelationEngine};
 use omnisec_security::AgentProfileManager;
+use omnisec_state::StateManager;
 use omnisec_storage::security::SecurityStorage;
-use omnisec_decision::{DecisionAction, DecisionEngine, EnforcementDecision};
-use omnisec_enforcement::EnforcementManager;
-use omnisec_runtime::RuntimeManager;
 use omnisec_storage::Storage;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -38,11 +38,11 @@ struct DaemonState {
     failed_count: usize,
     total_restarts: u64,
     // Sprint 5: Production observability metrics
-    detection_latency_ms: f64,      // Rolling average detection latency
-    event_throughput: f64,           // Events processed per second
-    nats_throughput: f64,            // NATS messages per second
-    restart_success_rate: f64,       // Percentage (0.0-100.0)
-    recovery_time_ms: f64,           // Average recovery time
+    detection_latency_ms: f64, // Rolling average detection latency
+    event_throughput: f64,     // Events processed per second
+    nats_throughput: f64,      // NATS messages per second
+    restart_success_rate: f64, // Percentage (0.0-100.0)
+    recovery_time_ms: f64,     // Average recovery time
     // Internal counters for computing rolling averages
     total_events: u64,
     total_nats_msgs: u64,
@@ -53,9 +53,9 @@ struct DaemonState {
 }
 
 struct DesignPartnerConfig {
-    safe_mode: bool,
-    recommendation_only: bool,
-    verbose: bool,
+    safe_mode: AtomicBool,
+    recommendation_only: AtomicBool,
+    verbose: AtomicBool,
 }
 
 #[tokio::main]
@@ -71,8 +71,8 @@ async fn main() -> Result<()> {
     tracing::info!("Starting Omnisec Daemon v0.2.0 (event-driven)");
 
     // --- NATS connection ---
-    let nats_url = std::env::var("NATS_URL")
-        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let nats_url =
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats = Arc::new(NatsClient::connect(&nats_url, "omnisec-daemon").await?);
 
     // --- Storage ---
@@ -86,7 +86,10 @@ async fn main() -> Result<()> {
                 tracing::warn!("Migration warning: {}", e);
             }
             if let Err(e) = s.bootstrap_organization().await {
-                tracing::error!("DB bootstrap failed — agents/events will not persist: {}", e);
+                tracing::error!(
+                    "DB bootstrap failed — agents/events will not persist: {}",
+                    e
+                );
             }
             Some(Arc::new(s))
         }
@@ -110,37 +113,45 @@ async fn main() -> Result<()> {
 
     // --- Design Partner Mode ---
     let design_partner = Arc::new(DesignPartnerConfig {
-        safe_mode: std::env::var("OMNISEC_SAFE_MODE").as_deref() == Ok("1"),
-        recommendation_only: std::env::var("OMNISEC_RECOMMENDATION_ONLY").as_deref() == Ok("1"),
-        verbose: std::env::var("OMNISEC_VERBOSE").as_deref() == Ok("1"),
+        safe_mode: AtomicBool::new(std::env::var("OMNISEC_SAFE_MODE").as_deref() == Ok("1")),
+        recommendation_only: AtomicBool::new(
+            std::env::var("OMNISEC_RECOMMENDATION_ONLY").as_deref() == Ok("1"),
+        ),
+        verbose: AtomicBool::new(std::env::var("OMNISEC_VERBOSE").as_deref() == Ok("1")),
     });
 
-    if design_partner.safe_mode {
+    if design_partner.safe_mode.load(Ordering::Relaxed) {
         tracing::warn!("┌─────────────────────────────────────────────────┐");
         tracing::warn!("│  SAFE MODE ACTIVE (OMNISEC_SAFE_MODE=1)         │");
         tracing::warn!("│  Enforcement actions will be logged but NOT     │");
         tracing::warn!("│  applied. No nftables rules, no SIGSTOP/KILL.   │");
         tracing::warn!("└─────────────────────────────────────────────────┘");
     }
-    if design_partner.recommendation_only {
+    if design_partner.recommendation_only.load(Ordering::Relaxed) {
         tracing::warn!("┌─────────────────────────────────────────────────┐");
         tracing::warn!("│  RECOMMENDATION-ONLY MODE (OMNISEC_RECOM.._=1) │");
         tracing::warn!("│  Decision engine runs; enforcement is skipped.  │");
         tracing::warn!("│  Decisions are published to NATS for review.    │");
         tracing::warn!("└─────────────────────────────────────────────────┘");
     }
-    if design_partner.verbose {
-        tracing::info!("Verbose mode active (OMNISEC_VERBOSE=1) — extended pipeline logging enabled");
+    if design_partner.verbose.load(Ordering::Relaxed) {
+        tracing::info!(
+            "Verbose mode active (OMNISEC_VERBOSE=1) — extended pipeline logging enabled"
+        );
     }
 
     // =====================================================================
     // State Recovery — hydrate in-memory engines from DB before tasks start
     // =====================================================================
-    let state_manager = storage.as_ref().map(|s| StateManager::new(s.pool().clone()));
+    let state_manager = storage
+        .as_ref()
+        .map(|s| StateManager::new(s.pool().clone()));
 
     // Recovered state shared across all tasks as Arc<StateSnapshot>. If no DB
     // or no prior state, this will be None and tasks use fresh defaults.
-    let recovered_snapshot: Option<Arc<omnisec_state::StateSnapshot>> = if let Some(ref sm) = state_manager {
+    let recovered_snapshot: Option<Arc<omnisec_state::StateSnapshot>> = if let Some(ref sm) =
+        state_manager
+    {
         match sm.recover_all().await {
             Ok(snapshot) => {
                 let id_count = snapshot.identities.len();
@@ -244,7 +255,10 @@ async fn main() -> Result<()> {
         let mut health_monitor = HealthMonitor::with_failure_threshold(3);
 
         // Subscribe to AgentDiscovered events to register agents for health monitoring
-        let mut agent_sub = match nats_health.subscribe::<AgentDiscoveredPayload>(subjects::AGENT_DISCOVERED).await {
+        let mut agent_sub = match nats_health
+            .subscribe::<AgentDiscoveredPayload>(subjects::AGENT_DISCOVERED)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to subscribe to AgentDiscovered: {}", e);
@@ -355,7 +369,8 @@ async fn main() -> Result<()> {
                             // Approximate: each recovery takes ~5s (single health check cycle)
                             s.total_recovery_time_ms += 5000;
                             if s.recovery_count > 0 {
-                                s.recovery_time_ms = s.total_recovery_time_ms as f64 / s.recovery_count as f64;
+                                s.recovery_time_ms =
+                                    s.total_recovery_time_ms as f64 / s.recovery_count as f64;
                             }
                         }
                     }
@@ -421,12 +436,16 @@ async fn main() -> Result<()> {
                 }
             }
             if imported > 0 {
-                tracing::info!("Restart engine hydrated with {} recovered entries", imported);
+                tracing::info!(
+                    "Restart engine hydrated with {} recovered entries",
+                    imported
+                );
             }
         }
 
         // Store the command line for each discovered agent so we can respawn
-        let mut agent_cmdlines: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        let mut agent_cmdlines: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
 
         // Subscribe to AgentDiscovered to capture cmdlines before agents die
         let mut discovered_sub = match nats_restart
@@ -435,7 +454,10 @@ async fn main() -> Result<()> {
         {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("Restart engine: failed to subscribe to AgentDiscovered: {}", e);
+                tracing::error!(
+                    "Restart engine: failed to subscribe to AgentDiscovered: {}",
+                    e
+                );
                 return;
             }
         };
@@ -597,7 +619,9 @@ async fn main() -> Result<()> {
     // Security Storage access (built before audit trail to avoid borrow-after-move)
     // =====================================================================
     let security_store: Arc<Option<SecurityStorage>> = Arc::new(
-        storage.as_ref().map(|s| SecurityStorage::new(s.pool().clone())),
+        storage
+            .as_ref()
+            .map(|s| SecurityStorage::new(s.pool().clone())),
     );
 
     // =====================================================================
@@ -624,12 +648,7 @@ async fn main() -> Result<()> {
                 let summary = format!("{} event from {}", subject, envelope.source);
 
                 if let Err(e) = storage
-                    .create_event(
-                        None,
-                        &subject.replace('.', "_"),
-                        "info",
-                        &summary,
-                    )
+                    .create_event(None, &subject.replace('.', "_"), "info", &summary)
                     .await
                 {
                     tracing::error!("Failed to persist audit event for {}: {}", subject, e);
@@ -666,7 +685,10 @@ async fn main() -> Result<()> {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!("Security pipeline: failed to subscribe to AgentDiscovered: {}", e);
+                    tracing::error!(
+                        "Security pipeline: failed to subscribe to AgentDiscovered: {}",
+                        e
+                    );
                     return;
                 }
             };
@@ -691,13 +713,18 @@ async fn main() -> Result<()> {
 
                     // Audit trail: profile created
                     if let Some(ref store) = sec_store.as_ref() {
-                        let _ = store.record_audit_entry(
-                            Some(pid as i32),
-                            Some(&name),
-                            "agent_registered",
-                            &format!("Agent {} (PID: {}) registered in security system", name, pid),
-                            &json!({"pid": pid, "name": name}),
-                        ).await;
+                        let _ = store
+                            .record_audit_entry(
+                                Some(pid as i32),
+                                Some(&name),
+                                "agent_registered",
+                                &format!(
+                                    "Agent {} (PID: {}) registered in security system",
+                                    name, pid
+                                ),
+                                &json!({"pid": pid, "name": name}),
+                            )
+                            .await;
                         let _ = store.record_timeline_entry(
                             Some(pid as i32),
                             Some(&name),
@@ -710,11 +737,14 @@ async fn main() -> Result<()> {
                     }
 
                     // Publish NATS profile updated event
-                    if let Err(e) = nats_sec.publish(
-                        subjects::SECURITY_PROFILE_UPDATED,
-                        "security-pipeline",
-                        json!({"pid": pid, "agent_name": name, "action": "registered"}),
-                    ).await {
+                    if let Err(e) = nats_sec
+                        .publish(
+                            subjects::SECURITY_PROFILE_UPDATED,
+                            "security-pipeline",
+                            json!({"pid": pid, "agent_name": name, "action": "registered"}),
+                        )
+                        .await
+                    {
                         tracing::error!("Failed to publish profile.updated: {}", e);
                     }
                 }
@@ -723,7 +753,11 @@ async fn main() -> Result<()> {
                 network_tracker.collect_connections();
 
                 let pids: Vec<u32> = {
-                    profile_manager.get_all_risk_scores().iter().map(|s| s.pid).collect()
+                    profile_manager
+                        .get_all_risk_scores()
+                        .iter()
+                        .map(|s| s.pid)
+                        .collect()
                 };
 
                 // --- Step 2-4: Profile update, fingerprint, anomaly, risk ---
@@ -734,7 +768,10 @@ async fn main() -> Result<()> {
                     let stats = network_tracker.get_traffic_stats(pid);
                     let destinations = network_tracker.get_destinations(pid);
 
-                    let name = match profile_manager.get_risk_score(pid).map(|s| s.agent_name.clone()) {
+                    let name = match profile_manager
+                        .get_risk_score(pid)
+                        .map(|s| s.agent_name.clone())
+                    {
                         Some(n) => n,
                         None => continue,
                     };
@@ -753,7 +790,8 @@ async fn main() -> Result<()> {
                     }
 
                     // Feed into fingerprint builder
-                    let dest_domains: Vec<String> = destinations.iter().map(|(ip, _, _)| ip.clone()).collect();
+                    let dest_domains: Vec<String> =
+                        destinations.iter().map(|(ip, _, _)| ip.clone()).collect();
                     let first_ip = dest_domains.first().cloned().unwrap_or_default();
                     fingerprint_manager.record_sample(
                         pid,
@@ -775,9 +813,13 @@ async fn main() -> Result<()> {
                     let baseline_state = profile_manager
                         .get_baseline(pid)
                         .map(|b| {
-                            if b.is_established() { omnisec_events::BaselineState::Established }
-                            else if b.is_training() { omnisec_events::BaselineState::Training }
-                            else { omnisec_events::BaselineState::Learning }
+                            if b.is_established() {
+                                omnisec_events::BaselineState::Established
+                            } else if b.is_training() {
+                                omnisec_events::BaselineState::Training
+                            } else {
+                                omnisec_events::BaselineState::Learning
+                            }
                         })
                         .unwrap_or(omnisec_events::BaselineState::Learning);
 
@@ -786,7 +828,8 @@ async fn main() -> Result<()> {
 
                     // Traffic spike
                     if let Some(anomaly) = anomaly_detector.check_traffic_spike(
-                        pid, &name,
+                        pid,
+                        &name,
                         stats.hour_avg_in + stats.hour_avg_out,
                         0.0, // baseline will be computed internally once samples exist
                         &baseline_state,
@@ -796,7 +839,8 @@ async fn main() -> Result<()> {
 
                     // Outbound spike
                     if let Some(anomaly) = anomaly_detector.check_outbound_spike(
-                        pid, &name,
+                        pid,
+                        &name,
                         stats.total_bytes_out,
                         stats.total_bytes_in,
                         &baseline_state,
@@ -806,12 +850,19 @@ async fn main() -> Result<()> {
 
                     // New destination check for each connection
                     let known_dests: Vec<String> = vec![
-                        "api.openai.com".to_string(), "api.anthropic.com".to_string(),
-                        "api.github.com".to_string(), "github.com".to_string(),
+                        "api.openai.com".to_string(),
+                        "api.anthropic.com".to_string(),
+                        "api.github.com".to_string(),
+                        "github.com".to_string(),
                     ];
                     for (ip, port, _proto) in &destinations {
                         if let Some(anomaly) = anomaly_detector.check_new_destination(
-                            pid, &name, ip, *port, &known_dests, &baseline_state,
+                            pid,
+                            &name,
+                            ip,
+                            *port,
+                            &known_dests,
+                            &baseline_state,
                         ) {
                             detected_anomalies.push(anomaly);
                         }
@@ -821,7 +872,11 @@ async fn main() -> Result<()> {
                     fingerprint_manager.finalize_fingerprint(pid);
                     if let Some(drift) = fingerprint_manager.detect_drift(pid) {
                         if let Some(anomaly) = anomaly_detector.check_fingerprint_drift(
-                            pid, &name, drift.drift_score, &drift.new_destinations, &baseline_state,
+                            pid,
+                            &name,
+                            drift.drift_score,
+                            &drift.new_destinations,
+                            &baseline_state,
                         ) {
                             detected_anomalies.push(anomaly);
                         }
@@ -830,7 +885,9 @@ async fn main() -> Result<()> {
                     // --- Create incidents and publish events for each anomaly ---
                     for anomaly in &detected_anomalies {
                         let severity = match anomaly.severity {
-                            omnisec_anomaly::AnomalySeverity::Critical => IncidentSeverity::Critical,
+                            omnisec_anomaly::AnomalySeverity::Critical => {
+                                IncidentSeverity::Critical
+                            }
                             omnisec_anomaly::AnomalySeverity::High => IncidentSeverity::High,
                             omnisec_anomaly::AnomalySeverity::Medium => IncidentSeverity::Medium,
                             omnisec_anomaly::AnomalySeverity::Low => IncidentSeverity::Low,
@@ -846,64 +903,84 @@ async fn main() -> Result<()> {
                             anomaly.description.clone(),
                         );
 
-                        let risk_score = profile_manager.get_risk_score(pid).map(|s| s.total_score).unwrap_or(0);
-                        let risk_level = profile_manager.get_risk_score(pid).map(|s| {
-                            match s.risk_level {
-                                omnisec_events::RiskLevel::Normal => "Normal",
-                                omnisec_events::RiskLevel::Suspicious => "Suspicious",
-                                omnisec_events::RiskLevel::HighRisk => "HighRisk",
-                                omnisec_events::RiskLevel::Critical => "Critical",
-                            }.to_string()
-                        }).unwrap_or_else(|| "Normal".to_string());
+                        let risk_score = profile_manager
+                            .get_risk_score(pid)
+                            .map(|s| s.total_score)
+                            .unwrap_or(0);
+                        let risk_level = profile_manager
+                            .get_risk_score(pid)
+                            .map(|s| {
+                                match s.risk_level {
+                                    omnisec_events::RiskLevel::Normal => "Normal",
+                                    omnisec_events::RiskLevel::Suspicious => "Suspicious",
+                                    omnisec_events::RiskLevel::HighRisk => "HighRisk",
+                                    omnisec_events::RiskLevel::Critical => "Critical",
+                                }
+                                .to_string()
+                            })
+                            .unwrap_or_else(|| "Normal".to_string());
 
                         // Publish anomaly event — this is what drives the enforcement pipeline
-                        if let Err(e) = nats_sec.publish(
-                            subjects::SECURITY_ANOMALY_DETECTED,
-                            "security-pipeline",
-                            json!({
-                                "pid": pid,
-                                "agent_name": name,
-                                "anomaly_type": format!("{:?}", anomaly.anomaly_type),
-                                "severity": format!("{:?}", anomaly.severity),
-                                "description": anomaly.description,
-                                "deviation": anomaly.deviation,
-                                "risk_score": risk_score,
-                                "risk_level": risk_level,
-                                "incident_id": incident.id.to_string(),
-                            }),
-                        ).await {
+                        if let Err(e) = nats_sec
+                            .publish(
+                                subjects::SECURITY_ANOMALY_DETECTED,
+                                "security-pipeline",
+                                json!({
+                                    "pid": pid,
+                                    "agent_name": name,
+                                    "anomaly_type": format!("{:?}", anomaly.anomaly_type),
+                                    "severity": format!("{:?}", anomaly.severity),
+                                    "description": anomaly.description,
+                                    "deviation": anomaly.deviation,
+                                    "risk_score": risk_score,
+                                    "risk_level": risk_level,
+                                    "incident_id": incident.id.to_string(),
+                                }),
+                            )
+                            .await
+                        {
                             tracing::error!("Failed to publish anomaly: {}", e);
                         }
 
                         tracing::warn!(
                             "ANOMALY: {:?} for {} (PID:{}) — {}",
-                            anomaly.anomaly_type, name, pid, anomaly.description
+                            anomaly.anomaly_type,
+                            name,
+                            pid,
+                            anomaly.description
                         );
 
                         // Persist incident to security storage
                         if let Some(ref store) = sec_store.as_ref() {
-                            let risk_score = profile_manager.get_risk_score(pid).map(|s| s.total_score).unwrap_or(0);
-                            let _ = store.insert_incident(
-                                pid as i32,
-                                &name,
-                                &format!("{:?}", anomaly.anomaly_type),
-                                risk_score as i32,
-                                &anomaly.description,
-                                &json!({
-                                    "incident_id": incident.id.to_string(),
-                                    "severity": format!("{:?}", anomaly.severity),
-                                }),
-                            ).await;
+                            let risk_score = profile_manager
+                                .get_risk_score(pid)
+                                .map(|s| s.total_score)
+                                .unwrap_or(0);
+                            let _ = store
+                                .insert_incident(
+                                    pid as i32,
+                                    &name,
+                                    &format!("{:?}", anomaly.anomaly_type),
+                                    risk_score as i32,
+                                    &anomaly.description,
+                                    &json!({
+                                        "incident_id": incident.id.to_string(),
+                                        "severity": format!("{:?}", anomaly.severity),
+                                    }),
+                                )
+                                .await;
 
-                            let _ = store.record_timeline_entry(
-                                Some(pid as i32),
-                                Some(&name),
-                                "anomaly_detected",
-                                &format!("{:?}", anomaly.severity).to_lowercase(),
-                                &format!("Anomaly: {:?}", anomaly.anomaly_type),
-                                &anomaly.description,
-                                &json!({ "deviation": anomaly.deviation }),
-                            ).await;
+                            let _ = store
+                                .record_timeline_entry(
+                                    Some(pid as i32),
+                                    Some(&name),
+                                    "anomaly_detected",
+                                    &format!("{:?}", anomaly.severity).to_lowercase(),
+                                    &format!("Anomaly: {:?}", anomaly.anomaly_type),
+                                    &anomaly.description,
+                                    &json!({ "deviation": anomaly.deviation }),
+                                )
+                                .await;
                         }
                     }
 
@@ -914,7 +991,10 @@ async fn main() -> Result<()> {
                         traffic_rate_in: stats.hour_avg_in,
                         traffic_rate_out: stats.hour_avg_out,
                         connection_count: stats.active_connections,
-                        risk_score: profile_manager.get_risk_score(pid).map(|s| s.total_score).unwrap_or(0),
+                        risk_score: profile_manager
+                            .get_risk_score(pid)
+                            .map(|s| s.total_score)
+                            .unwrap_or(0),
                         new_destinations: dest_domains,
                         active_hour: current_hour,
                         is_active: stats.active_connections > 0,
@@ -923,15 +1003,17 @@ async fn main() -> Result<()> {
 
                     // Persist traffic sample
                     if let Some(ref store) = sec_store.as_ref() {
-                        let _ = store.insert_traffic_sample(
-                            pid as i32,
-                            &name,
-                            stats.total_bytes_in as i64,
-                            stats.total_bytes_out as i64,
-                            stats.active_connections as i32,
-                            stats.active_connections as i32,
-                            "hour",
-                        ).await;
+                        let _ = store
+                            .insert_traffic_sample(
+                                pid as i32,
+                                &name,
+                                stats.total_bytes_in as i64,
+                                stats.total_bytes_out as i64,
+                                stats.active_connections as i32,
+                                stats.active_connections as i32,
+                                "hour",
+                            )
+                            .await;
                     }
                 }
 
@@ -940,33 +1022,42 @@ async fn main() -> Result<()> {
                     let correlation_alerts = correlation_engine.analyze(all_snapshots);
 
                     for alert in &correlation_alerts {
-                        tracing::info!("Correlation alert: {} — {}", alert.correlation_type, alert.description);
+                        tracing::info!(
+                            "Correlation alert: {} — {}",
+                            alert.correlation_type,
+                            alert.description
+                        );
 
                         // Publish correlation alert
-                        if let Err(e) = nats_sec.publish(
-                            subjects::SECURITY_CORRELATION_ALERT,
-                            "correlation-engine",
-                            json!({
-                                "correlation_type": format!("{:?}", alert.correlation_type),
-                                "description": alert.description,
-                                "affected_agents": alert.affected_agents,
-                                "severity": format!("{:?}", alert.severity),
-                            }),
-                        ).await {
+                        if let Err(e) = nats_sec
+                            .publish(
+                                subjects::SECURITY_CORRELATION_ALERT,
+                                "correlation-engine",
+                                json!({
+                                    "correlation_type": format!("{:?}", alert.correlation_type),
+                                    "description": alert.description,
+                                    "affected_agents": alert.affected_agents,
+                                    "severity": format!("{:?}", alert.severity),
+                                }),
+                            )
+                            .await
+                        {
                             tracing::error!("Failed to publish correlation alert: {}", e);
                         }
 
                         // Record timeline entry
                         if let Some(ref store) = sec_store.as_ref() {
-                            let _ = store.record_timeline_entry(
-                                None,
-                                None,
-                                "correlation_alert",
-                                &format!("{:?}", alert.severity),
-                                &format!("Correlation: {:?}", alert.correlation_type),
-                                &alert.description,
-                                &json!({"affected_agents": alert.affected_agents}),
-                            ).await;
+                            let _ = store
+                                .record_timeline_entry(
+                                    None,
+                                    None,
+                                    "correlation_alert",
+                                    &format!("{:?}", alert.severity),
+                                    &format!("Correlation: {:?}", alert.correlation_type),
+                                    &alert.description,
+                                    &json!({"affected_agents": alert.affected_agents}),
+                                )
+                                .await;
 
                             let _ = store.record_audit_entry(
                                 None,
@@ -997,27 +1088,31 @@ async fn main() -> Result<()> {
                             omnisec_events::RiskLevel::HighRisk => "HighRisk",
                             omnisec_events::RiskLevel::Critical => "Critical",
                         };
-                        let _ = store.upsert_risk_score(
-                            score.pid as i32,
-                            &score.agent_name,
-                            score.total_score as i32,
-                            score.destination_score as i32,
-                            score.traffic_score as i32,
-                            score.time_score as i32,
-                            score.behavior_score as i32,
-                            risk_level_str,
-                            &reasons,
-                        ).await;
+                        let _ = store
+                            .upsert_risk_score(
+                                score.pid as i32,
+                                &score.agent_name,
+                                score.total_score as i32,
+                                score.destination_score as i32,
+                                score.traffic_score as i32,
+                                score.time_score as i32,
+                                score.behavior_score as i32,
+                                risk_level_str,
+                                &reasons,
+                            )
+                            .await;
 
                         // Persist baseline state
                         if let Some(baseline) = profile_manager.get_baseline(score.pid) {
-                            let _ = store.upsert_baseline_state(
-                                score.pid as i32,
-                                &score.agent_name,
-                                &format!("{:?}", baseline.state),
-                                baseline.days_observed as i32,
-                                baseline.samples_collected as i64,
-                            ).await;
+                            let _ = store
+                                .upsert_baseline_state(
+                                    score.pid as i32,
+                                    &score.agent_name,
+                                    &format!("{:?}", baseline.state),
+                                    baseline.days_observed as i32,
+                                    baseline.samples_collected as i64,
+                                )
+                                .await;
                         }
                     }
                 }
@@ -1099,12 +1194,15 @@ async fn main() -> Result<()> {
             ];
 
             // Channel for profile updates
-            let (profile_tx, mut profile_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
+            let (profile_tx, mut profile_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
 
             tokio::spawn(async move {
                 while let Some((_subject, envelope)) = profile_sub.next().await {
                     if let Some(pid) = envelope.payload.get("pid").and_then(|v| v.as_u64()) {
-                        if let Some(name) = envelope.payload.get("agent_name").and_then(|v| v.as_str()) {
+                        if let Some(name) =
+                            envelope.payload.get("agent_name").and_then(|v| v.as_str())
+                        {
                             let _ = profile_tx.send((pid as u32, name.to_string()));
                         }
                     }
@@ -1152,11 +1250,13 @@ async fn main() -> Result<()> {
 
                         // Execute the decision — always records the action, runtime pipeline
                         // gates actual kernel enforcement in design partner modes.
-                        if enforce_config.safe_mode || enforce_config.recommendation_only {
+                        let is_safe = enforce_config.safe_mode.load(Ordering::Relaxed);
+                        let is_rec_only = enforce_config.recommendation_only.load(Ordering::Relaxed);
+                        if is_safe || is_rec_only {
                             tracing::info!(
                                 "DESIGN PARTNER MODE: would enforce {:?} on {} (PID: {}) — kernel actions gated ({})",
                                 decision.action, agent_name, pid,
-                                if enforce_config.safe_mode { "SAFE_MODE" } else { "RECOMMENDATION_ONLY" }
+                                if is_safe { "SAFE_MODE" } else { "RECOMMENDATION_ONLY" }
                             );
                         }
                         let action = enforcement_manager.execute(&decision);
@@ -1323,7 +1423,10 @@ async fn main() -> Result<()> {
             let mut runtime_manager = RuntimeManager::new();
             let mut cycle = 0u64;
 
-            tracing::info!("Runtime control pipeline started — mode: {:?}", runtime_manager.mode);
+            tracing::info!(
+                "Runtime control pipeline started — mode: {:?}",
+                runtime_manager.mode
+            );
 
             // Initialize nftables table on Linux
             #[cfg(target_os = "linux")]
@@ -1362,7 +1465,7 @@ async fn main() -> Result<()> {
                             action, agent_name, pid, reason
                         );
 
-                        let is_gated = runtime_config.safe_mode || runtime_config.recommendation_only;
+                        let is_gated = runtime_config.safe_mode.load(Ordering::Relaxed) || runtime_config.recommendation_only.load(Ordering::Relaxed);
 
                         match action {
                             "Block" => {
@@ -1543,7 +1646,10 @@ async fn main() -> Result<()> {
             if let Some(ref snap) = kernel_snapshot {
                 if !snap.identities.is_empty() {
                     identity_engine_obj.import_identities(snap.identities.clone());
-                    tracing::info!("Kernel stream: identity engine hydrated with {} recovered identities", snap.identities.len());
+                    tracing::info!(
+                        "Kernel stream: identity engine hydrated with {} recovered identities",
+                        snap.identities.len()
+                    );
                 }
             }
             let identity_engine = Arc::new(RwLock::new(identity_engine_obj));
@@ -1564,7 +1670,9 @@ async fn main() -> Result<()> {
                     if ebpf.is_using_fallback() {
                         tracing::info!("Kernel event stream: using /proc fallback (1s resolution)");
                     } else {
-                        tracing::info!("Kernel event stream: using eBPF (sub-second kernel telemetry)");
+                        tracing::info!(
+                            "Kernel event stream: using eBPF (sub-second kernel telemetry)"
+                        );
                     }
                 }
                 Err(e) => {
@@ -1580,19 +1688,41 @@ async fn main() -> Result<()> {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!("Kernel stream: failed to subscribe to AgentDiscovered: {}", e);
+                    tracing::error!(
+                        "Kernel stream: failed to subscribe to AgentDiscovered: {}",
+                        e
+                    );
                     return;
                 }
             };
 
-            let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel::<(u32, u32, String, String)>();
+            let (discovery_tx, mut discovery_rx) =
+                mpsc::unbounded_channel::<(u32, u32, String, String)>();
 
             tokio::spawn(async move {
                 while let Some((_subject, envelope)) = agent_sub.next().await {
-                    let pid = envelope.payload.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let ppid = envelope.payload.get("ppid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let name = envelope.payload.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let comm = envelope.payload.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let pid = envelope
+                        .payload
+                        .get("pid")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let ppid = envelope
+                        .payload
+                        .get("ppid")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let name = envelope
+                        .payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let comm = envelope
+                        .payload
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let _ = discovery_tx.send((pid, ppid, name, comm));
                 }
             });
@@ -1610,7 +1740,7 @@ async fn main() -> Result<()> {
 
                     // Process kernel events from eBPF sensors
                     Some(event) = kernel_rx.recv() => {
-                        if dp_kernel.verbose {
+                        if dp_kernel.verbose.load(Ordering::Relaxed) {
                             tracing::debug!("Kernel event: {:?}", event);
                         }
 
@@ -1779,6 +1909,54 @@ async fn main() -> Result<()> {
     }
 
     // =====================================================================
+    // Runtime mode-change subscription — allows safe/recommendation/enforcement
+    // toggle without container restart via POST /api/config/mode on the API.
+    // The API publishes omnisec.config.mode_change; we update atomics in-place.
+    // =====================================================================
+    {
+        let nats_mode = nats.clone();
+        let dp_mode = design_partner.clone();
+        tokio::spawn(async move {
+            let mut sub = match nats_mode
+                .subscribe::<serde_json::Value>(subjects::CONFIG_MODE_CHANGE)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Mode-change NATS subscribe failed: {}", e);
+                    return;
+                }
+            };
+            tracing::info!(
+                "Mode-change listener active on {}",
+                subjects::CONFIG_MODE_CHANGE
+            );
+            while let Some((_subj, envelope)) = sub.next().await {
+                let mode = envelope
+                    .payload
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("safe");
+                let (safe, rec_only) = match mode {
+                    "enforcement" => (false, false),
+                    "recommendation" => (false, true),
+                    _ => (true, false), // "safe" or unknown → safe
+                };
+                dp_mode.safe_mode.store(safe, Ordering::SeqCst);
+                dp_mode
+                    .recommendation_only
+                    .store(rec_only, Ordering::SeqCst);
+                tracing::warn!(
+                    "Operational mode changed → {} (safe={}, rec_only={})",
+                    mode,
+                    safe,
+                    rec_only
+                );
+            }
+        });
+    }
+
+    // =====================================================================
     // Health endpoint server
     // =====================================================================
     let health_state = daemon_state.clone();
@@ -1851,36 +2029,58 @@ pub async fn daemon_metrics_handler(
     out.push_str(&format!("omnisec_restarts_total {}\n\n", st.total_restarts));
 
     // Sprint 5: Detection latency (rolling average in ms)
-    out.push_str("# HELP omnisec_detection_latency_ms Anomaly-to-decision latency in milliseconds\n");
+    out.push_str(
+        "# HELP omnisec_detection_latency_ms Anomaly-to-decision latency in milliseconds\n",
+    );
     out.push_str("# TYPE omnisec_detection_latency_ms gauge\n");
-    out.push_str(&format!("omnisec_detection_latency_ms {}\n\n", st.detection_latency_ms));
+    out.push_str(&format!(
+        "omnisec_detection_latency_ms {}\n\n",
+        st.detection_latency_ms
+    ));
 
     // Sprint 5: Event throughput (events per second)
     out.push_str("# HELP omnisec_event_throughput Security events processed per second\n");
     out.push_str("# TYPE omnisec_event_throughput gauge\n");
-    out.push_str(&format!("omnisec_event_throughput {}\n\n", st.event_throughput));
+    out.push_str(&format!(
+        "omnisec_event_throughput {}\n\n",
+        st.event_throughput
+    ));
 
     // Sprint 5: NATS throughput (messages per second)
     out.push_str("# HELP omnisec_nats_throughput NATS messages processed per second\n");
     out.push_str("# TYPE omnisec_nats_throughput gauge\n");
-    out.push_str(&format!("omnisec_nats_throughput {}\n\n", st.nats_throughput));
+    out.push_str(&format!(
+        "omnisec_nats_throughput {}\n\n",
+        st.nats_throughput
+    ));
 
     // Sprint 5: Restart success rate (percentage 0-100)
-    out.push_str("# HELP omnisec_restart_success_rate Percentage of restart attempts that succeeded\n");
+    out.push_str(
+        "# HELP omnisec_restart_success_rate Percentage of restart attempts that succeeded\n",
+    );
     out.push_str("# TYPE omnisec_restart_success_rate gauge\n");
-    out.push_str(&format!("omnisec_restart_success_rate {}\n\n", st.restart_success_rate));
+    out.push_str(&format!(
+        "omnisec_restart_success_rate {}\n\n",
+        st.restart_success_rate
+    ));
 
     // Sprint 5: Recovery time (average in ms)
     out.push_str("# HELP omnisec_recovery_time_ms Average agent recovery time in milliseconds\n");
     out.push_str("# TYPE omnisec_recovery_time_ms gauge\n");
-    out.push_str(&format!("omnisec_recovery_time_ms {}\n\n", st.recovery_time_ms));
+    out.push_str(&format!(
+        "omnisec_recovery_time_ms {}\n\n",
+        st.recovery_time_ms
+    ));
 
     out.push_str("# HELP omnisec_build_info Daemon build information\n");
     out.push_str("# TYPE omnisec_build_info gauge\n");
     out.push_str("omnisec_build_info{version=\"0.2.0\",mode=\"production\",rustc=\"stable\"} 1\n");
 
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         out,
     )
 }
@@ -1923,7 +2123,9 @@ fn read_proc_cmdline(pid: u32) -> Option<String> {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).to_string())
             .collect();
-        if args.is_empty() { return None; }
+        if args.is_empty() {
+            return None;
+        }
         Some(args.join(" "))
     }
 
@@ -1939,10 +2141,7 @@ fn spawn_process(cmdline: &str) -> Option<u32> {
     let parts: Vec<&str> = cmdline.split_whitespace().collect();
     let (prog, args) = parts.split_first()?;
 
-    match std::process::Command::new(prog)
-        .args(args)
-        .spawn()
-    {
+    match std::process::Command::new(prog).args(args).spawn() {
         Ok(child) => {
             let new_pid = child.id();
             // Detach the child so it keeps running after we drop the handle

@@ -1,7 +1,8 @@
 # Omnisec Deployment Guide
 
-**Version:** 0.2.0  
-**Target:** Ubuntu 24.04 LTS (fresh VM)  
+**Version:** 0.3.0  
+**Target:** Ubuntu 26.04 LTS (fresh VM) — requires GLIBC 2.41+ (Debian Trixie runtime)  
+**Rust MSRV:** 1.91 (Cargo.lock v4, edition2024 crates)  
 **Deployment mode:** Design Partner (safe mode enabled, enforcement logged but not applied)
 
 ---
@@ -23,7 +24,19 @@ All data persists in named Docker volumes (`omnisec_dp_postgres`, `omnisec_dp_na
 
 ---
 
-## Part 1: Fresh Ubuntu 24.04 Setup
+## OS Compatibility
+
+| OS | Status | Notes |
+|---|---|---|
+| **Ubuntu 26.04 LTS** | **Supported** | GLIBC 2.41, kernel 7.x, Docker builds work |
+| Ubuntu 24.04 LTS | **Not supported** | GLIBC 2.36 — runtime crash on daemon/api startup |
+| Ubuntu 22.04 LTS | **Not supported** | GLIBC 2.35 — same crash |
+
+The Rust build chain uses `rust:1.91-slim` (Debian 13.2 Trixie), which links against GLIBC 2.41. The runner stage (`debian:trixie-slim`) matches. Ubuntu 24.04 ships Debian Bookworm (GLIBC 2.36) and will crash with `GLIBC_2.39 not found`.
+
+---
+
+## Part 1: Fresh Ubuntu 26.04 Setup
 
 ### 1.1 System update
 
@@ -363,10 +376,60 @@ The sqlx migrations in `crates/storage/migrations/` are embedded at compile time
 
 ### eBPF vs /proc fallback
 
-- eBPF requires kernel 5.8+, BTF support, and `CAP_BPF` inside the container
-- Docker containers with only `SYS_PTRACE`, `NET_ADMIN`, `DAC_READ_SEARCH` will use the `/proc` fallback
+The daemon container now requests: `CAP_BPF`, `CAP_PERFMON`, `NET_ADMIN`, `SYS_ADMIN`, `KILL`, `SYS_PTRACE`, `DAC_READ_SEARCH`.
+
+- **eBPF active**: requires kernel ≥ 5.8, BTF (`/sys/kernel/btf/vmlinux`), and `CAP_BPF` granted by the Docker host
+- **Note**: eBPF programs must be compiled with `bpf-linker` (not installed in the Docker build chain). The current deployment uses `/proc fallback` (1-second resolution) — identical event coverage, lower frequency
 - The `/proc:/host/proc:ro` volume mount enables the fallback mode
 - Both modes produce the same NATS events and dashboard data
+- To check which mode is active: `docker logs omnisec-dp-daemon 2>&1 | grep -i "ebpf\|fallback"`
+
+### Runtime Mode Toggle
+
+The daemon's enforcement mode can be changed without restart:
+
+```bash
+# Switch to enforcement mode (nftables blocking, cgroup throttle, SIGSTOP active)
+curl -X POST -H "X-API-Key: dp-demo-key" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"enforcement"}' \
+  http://localhost:3000/api/config/mode
+
+# Switch back to safe mode
+curl -X POST -H "X-API-Key: dp-demo-key" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"safe"}' \
+  http://localhost:3000/api/config/mode
+
+# Recommendation mode: decisions published, no enforcement
+curl -X POST -H "X-API-Key: dp-demo-key" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"recommendation"}' \
+  http://localhost:3000/api/config/mode
+```
+
+Mode changes propagate to the daemon via NATS within seconds. No container restart needed.
+
+### Linux Capabilities (daemon container)
+
+| Capability | Purpose |
+|---|---|
+| `NET_ADMIN` | nftables domain/IP blocking |
+| `SYS_ADMIN` | cgroup CPU/memory throttle |
+| `KILL` | SIGSTOP/SIGKILL process quarantine |
+| `BPF` | eBPF program loading |
+| `PERFMON` | eBPF tracepoint attachment |
+| `SYS_PTRACE` | /proc inspection across UIDs |
+| `DAC_READ_SEARCH` | Cross-user file reads |
+
+### NATS Health Check
+
+The NATS HTTP monitor (port 8222) may show connection errors in `curl` — this is normal. The functional NATS TCP port (4222) is what matters:
+
+```bash
+# Correct NATS health check (TCP, not HTTP)
+nc -z localhost 4222 && echo "NATS OK" || echo "NATS down"
+```
 
 ### NATS JetStream
 

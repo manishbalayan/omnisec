@@ -29,3 +29,5 @@ omnisec-runtime = { path = "../../crates/runtime" }
 omnisec-intelligence = { path = "../../crates/intelligence" }
 uuid.workspace = true
 omnisec-state = { path = "../../crates/state" }
+omnisec-messaging = { path = "../../crates/messaging" }
+omnisec-events = { path = "../../crates/events" }

@@ -8,27 +8,68 @@ Omnisec sits below AI agents and their harnesses at the operating system and net
 
 ## Architecture
 
-- **Sensor**: eBPF-based process and network monitoring
-- **Daemon**: Core orchestration service
-- **API**: REST API for dashboard and management
+- **Daemon**: Core orchestration — agent discovery, health monitoring, security pipeline, enforcement
+- **API**: REST API (port 3000) — management, config, Prometheus metrics
+- **Dashboard**: Next.js web UI (port 3002)
+- **eBPF sensor**: Kernel-level process/network/file monitoring (falls back to `/proc` in Docker)
+- **Policy Engine**: Priority-sorted rule evaluation with human overrides
 - **Proxy**: Transparent proxy for AI model requests
-- **Policy Engine**: YAML-driven policy enforcement
-- **Dashboard**: Next.js web interface
 
-## Quick Start
+## Requirements
 
-### Prerequisites
+| Requirement | Version |
+|---|---|
+| **OS** | Ubuntu 26.04 LTS (GLIBC 2.41 required) |
+| **Docker** | 24.x+ with Compose v2 |
+| **Rust** (dev only) | 1.91+ |
+| **Kernel** | 7.x (eBPF optional, falls back to /proc on older kernels) |
 
-- Docker and Docker Compose
-- Rust toolchain (for development)
+> **Ubuntu 24.04 is NOT supported.** The Rust build chain uses `rust:1.91-slim` (Debian Trixie, GLIBC 2.41). Running on Ubuntu 24.04 (GLIBC 2.36) causes a startup crash.
 
-### Development
+## Quick Start (Design Partner)
 
 ```bash
-# Start infrastructure
-docker-compose -f infra/docker/docker-compose.yml up -d
+git clone <repo> omnisec && cd omnisec
+chmod +x scripts/deploy-design-partner.sh
+./scripts/deploy-design-partner.sh
+```
 
-# Run API server
+All six services start in safe mode — enforcement decisions are logged but no kernel actions are applied.
+
+### Access
+
+| Service | URL | Auth |
+|---|---|---|
+| API | `http://localhost:3000` | `X-API-Key: dp-demo-key` |
+| Dashboard | `http://localhost:3002` | none |
+| NATS | `nats://localhost:4222` | none |
+
+### Toggle enforcement mode (no restart needed)
+
+```bash
+# Enable enforcement (nftables blocking, cgroup throttle, SIGSTOP active)
+curl -X POST -H "X-API-Key: dp-demo-key" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"enforcement"}' \
+  http://localhost:3000/api/config/mode
+
+# Back to safe mode
+curl -X POST -H "X-API-Key: dp-demo-key" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"safe"}' \
+  http://localhost:3000/api/config/mode
+```
+
+## Development
+
+```bash
+# Build all crates
+cargo build
+
+# Run tests
+cargo test
+
+# Run API
 cargo run --bin omnisec-api
 
 # Run daemon
@@ -38,21 +79,26 @@ cargo run --bin omnisec-daemon
 cd apps/dashboard && npm install && npm run dev
 ```
 
-### Production
-
-```bash
-docker-compose -f infra/docker/docker-compose.yml up --build
-```
-
 ## Configuration
 
-Environment variables:
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/omnisec` | PostgreSQL connection |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection |
+| `NATS_URL` | `nats://localhost:4222` | NATS connection |
+| `OMNISEC_SAFE_MODE` | `1` | `1` = enforcement logged not applied; `0` = live enforcement |
+| `OMNISEC_API_KEY` | unset (auth disabled) | API key for `X-API-Key` header |
+| `TELEGRAM_BOT_TOKEN` | unset | Telegram alerts (optional) |
+| `TELEGRAM_CHAT_ID` | unset | Telegram chat ID (optional) |
 
-- `DATABASE_URL`: PostgreSQL connection string
-- `REDIS_URL`: Redis connection string
-- `NATS_URL`: NATS connection string
-- `TELEGRAM_BOT_TOKEN`: Telegram bot token for alerts
-- `TELEGRAM_CHAT_ID`: Telegram chat ID for alerts
+## eBPF Status
+
+In Docker, the daemon runs in `/proc fallback` mode (1-second resolution). Native eBPF requires:
+- Kernel 5.8+ with BTF (`/sys/kernel/btf/vmlinux`)
+- `CAP_BPF` + `CAP_PERFMON` granted to the container
+- `bpf-linker` installed in the build environment
+
+Both modes produce identical NATS events and dashboard data.
 
 ## License
 

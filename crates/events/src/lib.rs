@@ -168,6 +168,9 @@ pub mod subjects {
     pub const DNS_QUERY: &str = "omnisec.dns.query";
     pub const IDENTITY_PID_MAPPED: &str = "omnisec.identity.pid_mapped";
 
+    // Operational config commands
+    pub const CONFIG_MODE_CHANGE: &str = "omnisec.config.mode_change";
+
     // Audit wildcard
     pub const WILDCARD_ALL: &str = "omnisec.>";
 }
@@ -645,8 +648,8 @@ pub struct NetworkConnectPayload {
     pub dest_port: u16,
     pub src_ip: String,
     pub src_port: u16,
-    pub protocol: String,        // "tcp" or "udp"
-    pub domain: Option<String>,  // resolved from DNS correlation
+    pub protocol: String,       // "tcp" or "udp"
+    pub domain: Option<String>, // resolved from DNS correlation
     pub timestamp_ns: u64,
     pub agent_id: String,
 }
@@ -681,7 +684,7 @@ pub struct FileAccessPayload {
     pub pid: u32,
     pub uid: u32,
     pub path: String,
-    pub operation: String,        // "open", "openat", "unlink", "rename", "chmod"
+    pub operation: String, // "open", "openat", "unlink", "rename", "chmod"
     pub flags: u32,
     pub mode: u32,
     pub timestamp_ns: u64,
@@ -701,7 +704,7 @@ pub struct FileDeletePayload {
 pub struct FileModifyPayload {
     pub pid: u32,
     pub path: String,
-    pub operation: String,        // "chmod", "rename"
+    pub operation: String, // "chmod", "rename"
     pub timestamp_ns: u64,
     pub agent_id: Option<String>,
 }
@@ -714,7 +717,7 @@ pub struct FileModifyPayload {
 pub struct DnsQueryPayload {
     pub pid: u32,
     pub domain: String,
-    pub query_type: String,       // "A", "AAAA", "TXT", etc.
+    pub query_type: String, // "A", "AAAA", "TXT", etc.
     pub resolver_ip: String,
     pub response_ips: Vec<String>,
     pub timestamp_ns: u64,
@@ -740,7 +743,10 @@ pub struct IdentityPidMappedPayload {
 // Serialization helper
 // ---------------------------------------------------------------------------
 
-pub fn serialize_envelope<T: Serialize>(source: &str, payload: T) -> Result<Vec<u8>, serde_json::Error> {
+pub fn serialize_envelope<T: Serialize>(
+    source: &str,
+    payload: T,
+) -> Result<Vec<u8>, serde_json::Error> {
     let envelope = EventEnvelope::new(source, payload);
     serde_json::to_vec(&envelope)
 }
@@ -784,16 +790,25 @@ mod tests {
 
     #[test]
     fn test_subject_constants() {
-        assert_eq!(subjects::SYSTEMD_SERVICE_DISCOVERED, "omnisec.systemd.service_discovered");
+        assert_eq!(
+            subjects::SYSTEMD_SERVICE_DISCOVERED,
+            "omnisec.systemd.service_discovered"
+        );
         assert_eq!(subjects::AGENT_HUNG, "omnisec.agent.hung");
         assert_eq!(subjects::AGENT_MEMORY_LEAK, "omnisec.agent.memory_leak");
         assert_eq!(subjects::INCIDENT_CREATED, "omnisec.incident.created");
         assert_eq!(subjects::HEARTBEAT_MISSED, "omnisec.agent.heartbeat_missed");
         assert_eq!(subjects::DEPENDENCY_FAILURE, "omnisec.dependency.failure");
         assert_eq!(subjects::SECURITY_ANOMALY, "omnisec.security.anomaly");
-        assert_eq!(subjects::SECURITY_RISK_CHANGED, "omnisec.security.risk_changed");
+        assert_eq!(
+            subjects::SECURITY_RISK_CHANGED,
+            "omnisec.security.risk_changed"
+        );
         assert_eq!(subjects::NETWORK_CONNECTION, "omnisec.network.connection");
         assert_eq!(subjects::FINGERPRINT_CREATED, "omnisec.fingerprint.created");
-        assert_eq!(subjects::FINGERPRINT_DRIFT_DETECTED, "omnisec.fingerprint.drift_detected");
+        assert_eq!(
+            subjects::FINGERPRINT_DRIFT_DETECTED,
+            "omnisec.fingerprint.drift_detected"
+        );
     }
 }

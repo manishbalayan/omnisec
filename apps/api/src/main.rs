@@ -6,24 +6,25 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use omnisec_intelligence::{CostIntelligenceEngine, RecommendationEngine};
-use std::sync::OnceLock;
-
-/// Cached API key — read once from the environment at first request.
-static API_KEY: OnceLock<Option<String>> = OnceLock::new();
 use chrono::Utc;
 use omnisec_anomaly::AnomalyDetector;
 use omnisec_decision::DecisionEngine;
 use omnisec_discovery::AgentDiscovery;
 use omnisec_enforcement::EnforcementManager;
+use omnisec_events::subjects;
 use omnisec_fingerprint::FingerprintManager;
+use omnisec_intelligence::{CostIntelligenceEngine, RecommendationEngine};
+use omnisec_messaging::NatsClient;
 use omnisec_security::AgentProfileManager;
 use omnisec_storage::Storage;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Cached API key — read once from the environment at first request.
+static API_KEY: OnceLock<Option<String>> = OnceLock::new();
 
 struct AppState {
     storage: Storage,
@@ -31,6 +32,10 @@ struct AppState {
     discovery: AgentDiscovery,
     security: SecurityState,
     enforcement: EnforcementState,
+    /// Live NATS client — used to publish config changes to the daemon.
+    nats: Option<Arc<NatsClient>>,
+    /// Current operational mode ("safe", "recommendation", "enforcement").
+    operational_mode: String,
 }
 
 struct SecurityState {
@@ -70,6 +75,34 @@ async fn main() -> anyhow::Result<()> {
 
     let state_manager = Some(omnisec_state::StateManager::new(storage.pool().clone()));
 
+    // Connect to NATS (best-effort — API continues without it)
+    let nats_url =
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let nats_client: Option<Arc<NatsClient>> =
+        match NatsClient::connect(&nats_url, "omnisec-api").await {
+            Ok(c) => {
+                tracing::info!("API connected to NATS at {}", nats_url);
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "API NATS unavailable (mode changes won't propagate to daemon): {}",
+                    e
+                );
+                None
+            }
+        };
+
+    let initial_mode = std::env::var("OMNISEC_SAFE_MODE")
+        .map(|v| {
+            if v == "1" {
+                "safe".to_string()
+            } else {
+                "enforcement".to_string()
+            }
+        })
+        .unwrap_or_else(|_| "safe".to_string());
+
     let state = Arc::new(RwLock::new(AppState {
         storage,
         state_manager,
@@ -89,6 +122,8 @@ async fn main() -> anyhow::Result<()> {
                 enforcement_manager: EnforcementManager::new(),
             }
         },
+        nats: nats_client,
+        operational_mode: initial_mode,
     }));
 
     let cors = CorsLayer::new()
@@ -109,7 +144,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/security/audit", get(get_security_audit))
         .route("/api/security/incidents", get(get_security_incidents))
         .route("/api/security/correlation", get(get_correlation_alerts))
-        .route("/api/security/operations", get(get_security_operations_overview))
+        .route(
+            "/api/security/operations",
+            get(get_security_operations_overview),
+        )
         // Enforcement endpoints
         .route("/api/enforcement/decisions", get(get_enforcement_decisions))
         .route("/api/enforcement/actions", get(get_enforcement_actions))
@@ -120,22 +158,47 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/enforcement/overrides", get(get_overrides))
         // Enforcement list management (dynamic — Sprint 2)
         .route("/api/enforcement/lists/{list_type}", get(get_dynamic_list))
-        .route("/api/enforcement/lists/{list_type}/add", post(add_to_dynamic_list))
-        .route("/api/enforcement/lists/{list_type}/remove", post(remove_from_dynamic_list))
-        .route("/api/enforcement/lists/{list_type}/sync", post(sync_dynamic_list))
+        .route(
+            "/api/enforcement/lists/{list_type}/add",
+            post(add_to_dynamic_list),
+        )
+        .route(
+            "/api/enforcement/lists/{list_type}/remove",
+            post(remove_from_dynamic_list),
+        )
+        .route(
+            "/api/enforcement/lists/{list_type}/sync",
+            post(sync_dynamic_list),
+        )
         // Known executables management
-        .route("/api/enforcement/executables/known", get(get_known_executables))
-        .route("/api/enforcement/executables/blocked", get(get_blocked_executables))
+        .route(
+            "/api/enforcement/executables/known",
+            get(get_known_executables),
+        )
+        .route(
+            "/api/enforcement/executables/blocked",
+            get(get_blocked_executables),
+        )
         // Sensitive paths management
         .route("/api/enforcement/paths/sensitive", get(get_sensitive_paths))
         // Operational config
         .route("/api/config", get(get_all_config))
+        .route("/api/config/mode", post(set_operational_mode))
         .route("/api/config/{key}", get(get_config))
         .route("/api/config/{key}", post(set_config))
         .route("/api/intelligence/cost", get(get_cost_dashboard))
-        .route("/api/intelligence/recommendations", get(get_recommendations))
-        .route("/api/intelligence/recommendations/{id}/approve", post(approve_recommendation))
-        .route("/api/intelligence/recommendations/{id}/reject", post(reject_recommendation))
+        .route(
+            "/api/intelligence/recommendations",
+            get(get_recommendations),
+        )
+        .route(
+            "/api/intelligence/recommendations/{id}/approve",
+            post(approve_recommendation),
+        )
+        .route(
+            "/api/intelligence/recommendations/{id}/reject",
+            post(reject_recommendation),
+        )
         // Metrics (Prometheus-compatible text format)
         .route("/metrics", get(prometheus_metrics))
         // CORS must run BEFORE auth so preflight OPTIONS requests are handled
@@ -144,8 +207,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let bind =
-        std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let bind = std::env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("API listening on {}", bind);
@@ -155,10 +217,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn auth_middleware(
-    request: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+async fn auth_middleware(request: axum::http::Request<axum::body::Body>, next: Next) -> Response {
     // Health endpoint is always accessible
     if request.uri().path() == "/" {
         return next.run(request).await;
@@ -237,9 +296,7 @@ async fn list_events(
     }
 }
 
-async fn get_risk_scores(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_risk_scores(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     let scores: Vec<Value> = state
         .security
@@ -275,44 +332,40 @@ async fn get_agent_risk_score(
 ) -> Json<Value> {
     let state = state.read().await;
     match state.security.profile_manager.get_risk_score(pid) {
-        Some(s) => {
-            Json(json!({
-                "pid": s.pid,
-                "agent_name": s.agent_name,
-                "total_score": s.total_score,
-                "destination_score": s.destination_score,
-                "traffic_score": s.traffic_score,
-                "time_score": s.time_score,
-                "behavior_score": s.behavior_score,
-                "reasons": s.reasons,
-                "risk_level": match s.risk_level {
-                    omnisec_security::RiskLevel::Normal => "Normal",
-                    omnisec_security::RiskLevel::Suspicious => "Suspicious",
-                    omnisec_security::RiskLevel::HighRisk => "HighRisk",
-                    omnisec_security::RiskLevel::Critical => "Critical",
-                },
-                "destination_profile": state.security.profile_manager
-                    .get_destination_profile(pid)
-                    .map(|p| json!({
-                        "destination_count": p.destination_count(),
-                        "known_ports": p.known_ports.iter().collect::<Vec<_>>(),
-                    })),
-                "baseline": state.security.profile_manager
-                    .get_baseline(pid)
-                    .map(|b| json!({
-                        "state": format!("{:?}", b.state),
-                        "days_observed": b.days_observed,
-                        "samples_collected": b.samples_collected,
-                    })),
-            }))
-        }
+        Some(s) => Json(json!({
+            "pid": s.pid,
+            "agent_name": s.agent_name,
+            "total_score": s.total_score,
+            "destination_score": s.destination_score,
+            "traffic_score": s.traffic_score,
+            "time_score": s.time_score,
+            "behavior_score": s.behavior_score,
+            "reasons": s.reasons,
+            "risk_level": match s.risk_level {
+                omnisec_security::RiskLevel::Normal => "Normal",
+                omnisec_security::RiskLevel::Suspicious => "Suspicious",
+                omnisec_security::RiskLevel::HighRisk => "HighRisk",
+                omnisec_security::RiskLevel::Critical => "Critical",
+            },
+            "destination_profile": state.security.profile_manager
+                .get_destination_profile(pid)
+                .map(|p| json!({
+                    "destination_count": p.destination_count(),
+                    "known_ports": p.known_ports.iter().collect::<Vec<_>>(),
+                })),
+            "baseline": state.security.profile_manager
+                .get_baseline(pid)
+                .map(|b| json!({
+                    "state": format!("{:?}", b.state),
+                    "days_observed": b.days_observed,
+                    "samples_collected": b.samples_collected,
+                })),
+        })),
         None => Json(json!({"error": "Agent not found"})),
     }
 }
 
-async fn get_anomalies(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_anomalies(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     let anomalies: Vec<Value> = state
         .security
@@ -344,9 +397,7 @@ async fn get_anomalies(
 // Security Timeline API
 // =====================================================================
 
-async fn get_security_timeline(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_security_timeline(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     // Return timeline from storage if available, otherwise return empty
     match state.storage.get_events(None).await {
@@ -412,9 +463,7 @@ async fn get_agent_timeline(
 // Security Audit API
 // =====================================================================
 
-async fn get_security_audit(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_security_audit(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     match state.storage.get_events(None).await {
         Ok(events) => Json(json!({
@@ -432,9 +481,7 @@ async fn get_security_audit(
 // Security Incidents API
 // =====================================================================
 
-async fn get_security_incidents(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_security_incidents(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     // Collect security-relevant anomalies as incident data
     let anomalies = state.security.anomaly_detector.get_all_anomalies();
@@ -486,9 +533,7 @@ async fn get_security_incidents(
 // Correlation Alerts API
 // =====================================================================
 
-async fn get_correlation_alerts(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_correlation_alerts(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     // Collect risk scores for correlation insights
     let risk_scores = state.security.profile_manager.get_all_risk_scores();
@@ -508,7 +553,8 @@ async fn get_correlation_alerts(
     }
 
     if total_agents > 0 {
-        let avg_score = risk_scores.iter().map(|s| s.total_score).sum::<u32>() as f64 / total_agents as f64;
+        let avg_score =
+            risk_scores.iter().map(|s| s.total_score).sum::<u32>() as f64 / total_agents as f64;
         if avg_score > 50.0 {
             correlations.push(json!({
                 "correlation_type": "GlobalRiskElevation",
@@ -626,9 +672,7 @@ async fn get_security_operations_overview(
 // Enforcement API Handlers
 // =====================================================================
 
-async fn get_enforcement_decisions(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_enforcement_decisions(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     let decisions: Vec<Value> = state
         .enforcement
@@ -665,9 +709,7 @@ async fn get_enforcement_decisions(
     }))
 }
 
-async fn get_enforcement_actions(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_enforcement_actions(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     let actions: Vec<Value> = state
         .enforcement
@@ -696,9 +738,7 @@ async fn get_enforcement_actions(
     }))
 }
 
-async fn get_enforcement_incidents(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_enforcement_incidents(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     let open_incidents: Vec<Value> = state
         .enforcement
@@ -748,14 +788,17 @@ async fn get_enforcement_incidents(
     }))
 }
 
-async fn get_enforcement_stats(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_enforcement_stats(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     let stats = state.enforcement.enforcement_manager.get_stats();
     let decision_count = state.enforcement.decision_engine.decision_count();
     let overrides = state.enforcement.decision_engine.get_overrides().len();
-    let flagged_processes = state.enforcement.enforcement_manager.process.get_flagged_processes().len();
+    let flagged_processes = state
+        .enforcement
+        .enforcement_manager
+        .process
+        .get_flagged_processes()
+        .len();
 
     Json(json!({
         "blocked_destinations": stats.blocked_destinations,
@@ -770,31 +813,33 @@ async fn get_enforcement_stats(
     }))
 }
 
-async fn get_block_list(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_block_list(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
-    let block_list: Vec<String> = state.enforcement.enforcement_manager.network.get_block_list();
+    let block_list: Vec<String> = state
+        .enforcement
+        .enforcement_manager
+        .network
+        .get_block_list();
     Json(json!({
         "block_list": block_list,
         "total": block_list.len()
     }))
 }
 
-async fn get_allow_list(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_allow_list(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
-    let allow_list: Vec<String> = state.enforcement.enforcement_manager.network.get_allow_list();
+    let allow_list: Vec<String> = state
+        .enforcement
+        .enforcement_manager
+        .network
+        .get_allow_list();
     Json(json!({
         "allow_list": allow_list,
         "total": allow_list.len()
     }))
 }
 
-async fn get_overrides(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_overrides(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     let overrides: Vec<Value> = state
         .enforcement
@@ -830,24 +875,18 @@ async fn get_cost_dashboard(
 ) -> Json<Value> {
     let state = state.read().await;
     let days: i32 = params.get("days").and_then(|d| d.parse().ok()).unwrap_or(7);
-    let engine = CostIntelligenceEngine::new(
-        state.storage.pool().clone(),
-        state.storage.default_org_id,
-    );
+    let engine =
+        CostIntelligenceEngine::new(state.storage.pool().clone(), state.storage.default_org_id);
     match engine.cost_dashboard(days).await {
         Ok(dashboard) => Json(serde_json::to_value(&dashboard).unwrap_or(json!({}))),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }
 
-async fn get_recommendations(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_recommendations(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
-    let engine = RecommendationEngine::new(
-        state.storage.pool().clone(),
-        state.storage.default_org_id,
-    );
+    let engine =
+        RecommendationEngine::new(state.storage.pool().clone(), state.storage.default_org_id);
     match engine.pending_recommendations().await {
         Ok(recs) => Json(json!({ "recommendations": recs, "total": recs.len() })),
         Err(e) => Json(json!({ "error": e.to_string() })),
@@ -860,11 +899,10 @@ async fn approve_recommendation(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let state = state.read().await;
-    let engine = RecommendationEngine::new(
-        state.storage.pool().clone(),
-        state.storage.default_org_id,
-    );
-    let approved_by = body.get("approved_by")
+    let engine =
+        RecommendationEngine::new(state.storage.pool().clone(), state.storage.default_org_id);
+    let approved_by = body
+        .get("approved_by")
         .and_then(|v| v.as_str())
         .unwrap_or("api-user");
     match engine.approve_recommendation(id, approved_by).await {
@@ -879,11 +917,10 @@ async fn reject_recommendation(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let state = state.read().await;
-    let engine = RecommendationEngine::new(
-        state.storage.pool().clone(),
-        state.storage.default_org_id,
-    );
-    let reason = body.get("reason")
+    let engine =
+        RecommendationEngine::new(state.storage.pool().clone(), state.storage.default_org_id);
+    let reason = body
+        .get("reason")
         .and_then(|v| v.as_str())
         .unwrap_or("no reason given");
     match engine.reject_recommendation(id, reason).await {
@@ -902,10 +939,26 @@ async fn get_dynamic_list(
 ) -> Json<Value> {
     let state = state.read().await;
     let list = match list_type.as_str() {
-        "block" => state.enforcement.enforcement_manager.network.get_block_list(),
-        "allow" => state.enforcement.enforcement_manager.network.get_allow_list(),
-        "known-exec" => state.enforcement.enforcement_manager.process.get_known_executables(),
-        "blocked-exec" => state.enforcement.enforcement_manager.process.get_blocked_executables(),
+        "block" => state
+            .enforcement
+            .enforcement_manager
+            .network
+            .get_block_list(),
+        "allow" => state
+            .enforcement
+            .enforcement_manager
+            .network
+            .get_allow_list(),
+        "known-exec" => state
+            .enforcement
+            .enforcement_manager
+            .process
+            .get_known_executables(),
+        "blocked-exec" => state
+            .enforcement
+            .enforcement_manager
+            .process
+            .get_blocked_executables(),
         _ => return Json(json!({"error": "Invalid list type"})),
     };
     Json(json!({"list": list, "total": list.len()}))
@@ -916,8 +969,16 @@ async fn add_to_dynamic_list(
     Path(list_type): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let target = body.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("api").to_string();
+    let target = body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("api")
+        .to_string();
     if target.is_empty() {
         return Json(json!({"error": "Missing 'target' field"}));
     }
@@ -925,8 +986,16 @@ async fn add_to_dynamic_list(
     {
         let mut st = state.write().await;
         match list_type.as_str() {
-            "block" => st.enforcement.enforcement_manager.network.add_to_block_list(target.clone(), reason.clone()),
-            "allow" => st.enforcement.enforcement_manager.network.add_to_allow_list(target.clone()),
+            "block" => st
+                .enforcement
+                .enforcement_manager
+                .network
+                .add_to_block_list(target.clone(), reason.clone()),
+            "allow" => st
+                .enforcement
+                .enforcement_manager
+                .network
+                .add_to_allow_list(target.clone()),
             _ => {}
         }
     }
@@ -956,7 +1025,11 @@ async fn remove_from_dynamic_list(
     Path(list_type): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let target = body.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let target = body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if target.is_empty() {
         return Json(json!({"error": "Missing 'target' field"}));
     }
@@ -964,7 +1037,11 @@ async fn remove_from_dynamic_list(
     {
         let mut st = state.write().await;
         match list_type.as_str() {
-            "block" => st.enforcement.enforcement_manager.network.remove_from_block_list(&target),
+            "block" => st
+                .enforcement
+                .enforcement_manager
+                .network
+                .remove_from_block_list(&target),
             _ => {}
         }
     }
@@ -995,9 +1072,14 @@ async fn sync_dynamic_list(
 ) -> Json<Value> {
     let state = state.read().await;
     if let Some(sm) = state.state_manager.as_ref() {
-        let entries: Vec<String> = body.get("entries")
+        let entries: Vec<String> = body
+            .get("entries")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         let db_type = match list_type.as_str() {
             "block" => "block",
@@ -1013,27 +1095,33 @@ async fn sync_dynamic_list(
     }
 }
 
-async fn get_known_executables(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_known_executables(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
-    let execs: Vec<String> = state.enforcement.enforcement_manager.process.get_known_executables();
+    let execs: Vec<String> = state
+        .enforcement
+        .enforcement_manager
+        .process
+        .get_known_executables();
     Json(json!({"known_executables": execs, "total": execs.len()}))
 }
 
-async fn get_blocked_executables(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_blocked_executables(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
-    let execs: Vec<String> = state.enforcement.enforcement_manager.process.get_blocked_executables();
+    let execs: Vec<String> = state
+        .enforcement
+        .enforcement_manager
+        .process
+        .get_blocked_executables();
     Json(json!({"blocked_executables": execs, "total": execs.len()}))
 }
 
-async fn get_sensitive_paths(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_sensitive_paths(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
-    let paths: Vec<String> = state.enforcement.enforcement_manager.file_access.get_sensitive_paths();
+    let paths: Vec<String> = state
+        .enforcement
+        .enforcement_manager
+        .file_access
+        .get_sensitive_paths();
     Json(json!({"sensitive_paths": paths, "total": paths.len()}))
 }
 
@@ -1041,9 +1129,7 @@ async fn get_sensitive_paths(
 // Operational Config (Sprint 2)
 // =====================================================================
 
-async fn get_all_config(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> Json<Value> {
+async fn get_all_config(State(state): State<Arc<RwLock<AppState>>>) -> Json<Value> {
     let state = state.read().await;
     if let Some(ref sm) = state.state_manager {
         match sm.get_all_config().await {
@@ -1079,7 +1165,10 @@ async fn set_config(
     let state = state.read().await;
     if let Some(ref sm) = state.state_manager {
         let value = body.get("value").cloned().unwrap_or(json!(null));
-        let description = body.get("description").and_then(|v| v.as_str()).unwrap_or("set via API");
+        let description = body
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("set via API");
         match sm.set_config(&key, value, description).await {
             Ok(()) => Json(json!({"status": "saved", "key": key})),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -1090,12 +1179,65 @@ async fn set_config(
 }
 
 // ---------------------------------------------------------------------------
+// Operational mode toggle — POST /api/config/mode
+// Body: { "mode": "safe" | "recommendation" | "enforcement" }
+// Publishes omnisec.config.mode_change to NATS so the daemon updates atomically
+// without restart. Also records the new mode in AppState and DB config.
+// ---------------------------------------------------------------------------
+
+async fn set_operational_mode(
+    State(state): State<Arc<RwLock<AppState>>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let mode = match body.get("mode").and_then(|v| v.as_str()) {
+        Some(m) if matches!(m, "safe" | "recommendation" | "enforcement") => m.to_string(),
+        Some(bad) => {
+            return Json(
+                json!({"error": format!("Invalid mode '{}'. Use: safe, recommendation, enforcement", bad)}),
+            )
+        }
+        None => return Json(json!({"error": "Missing 'mode' field"})),
+    };
+
+    let mut state = state.write().await;
+    state.operational_mode = mode.clone();
+
+    // Persist to DB so the mode survives API restarts
+    if let Some(ref sm) = state.state_manager {
+        let _ = sm
+            .set_config("operational_mode", json!(mode), "set via /api/config/mode")
+            .await;
+    }
+
+    // Publish to NATS so daemon updates atomically (best-effort)
+    let nats_result = if let Some(ref nats) = state.nats {
+        match nats
+            .publish(subjects::CONFIG_MODE_CHANGE, "api", json!({"mode": mode}))
+            .await
+        {
+            Ok(()) => "published".to_string(),
+            Err(e) => {
+                tracing::warn!("Mode change NATS publish failed: {}", e);
+                format!("nats_error: {}", e)
+            }
+        }
+    } else {
+        "nats_unavailable".to_string()
+    };
+
+    tracing::warn!(
+        "Operational mode changed to '{}' via API (nats={})",
+        mode,
+        nats_result
+    );
+    Json(json!({"status": "ok", "mode": mode, "nats": nats_result}))
+}
+
+// ---------------------------------------------------------------------------
 // Prometheus metrics endpoint (Phase 5 — operations hardening)
 // ---------------------------------------------------------------------------
 
-async fn prometheus_metrics(
-    State(state): State<Arc<RwLock<AppState>>>,
-) -> impl IntoResponse {
+async fn prometheus_metrics(State(state): State<Arc<RwLock<AppState>>>) -> impl IntoResponse {
     let state = state.read().await;
 
     let agents = state.discovery.discover_agents().unwrap_or_default();
@@ -1114,15 +1256,25 @@ async fn prometheus_metrics(
 
     out.push_str("# HELP omnisec_enforcement_active_rules Active nftables rules\n");
     out.push_str("# TYPE omnisec_enforcement_active_rules gauge\n");
-    out.push_str(&format!("omnisec_enforcement_active_rules {}\n\n",
-        state.enforcement.enforcement_manager.network.get_block_list().len()));
+    out.push_str(&format!(
+        "omnisec_enforcement_active_rules {}\n\n",
+        state
+            .enforcement
+            .enforcement_manager
+            .network
+            .get_block_list()
+            .len()
+    ));
 
     out.push_str("# HELP omnisec_info Omnisec daemon info\n");
     out.push_str("# TYPE omnisec_info gauge\n");
     out.push_str("omnisec_info{version=\"0.2.0\",mode=\"production\"} 1\n");
 
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         out,
     )
 }

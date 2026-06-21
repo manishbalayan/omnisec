@@ -79,11 +79,19 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       OMNISEC_API_KEY: ${OMNISEC_API_KEY:-dp-demo-key}
     cap_add:
-      - SYS_PTRACE
-      - NET_ADMIN
-      - DAC_READ_SEARCH
+      - SYS_PTRACE          # /proc inspection
+      - NET_ADMIN           # nftables network enforcement
+      - DAC_READ_SEARCH     # cross-user /proc reads
+      - SYS_ADMIN           # cgroup writes (/sys/fs/cgroup)
+      - KILL                # SIGSTOP/SIGKILL process quarantine
+      - BPF                 # eBPF program loading (kernel ≥ 5.8)
+      - PERFMON             # eBPF tracepoint/kprobe attachment
+    cgroupns: host          # share host cgroup namespace so cgroup writes land correctly
     volumes:
       - /proc:/host/proc:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw   # cgroup enforcement
+      - /sys/fs/bpf:/sys/fs/bpf:rw         # eBPF pin filesystem
+      - /sys/kernel/btf:/sys/kernel/btf:ro # BTF type info for CO-RE eBPF
     depends_on:
       postgres:
         condition: service_healthy
