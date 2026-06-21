@@ -1,0 +1,32 @@
+# Rust build artifacts (~400MB)
+target/
+**/target/
+
+# Node/Next.js
+node_modules/
+**/.next/
+apps/dashboard/.next/
+apps/dashboard/node_modules/
+
+# Git
+.git/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Logs and temp
+*.log
+tmp/
+.tmp/
+
+# Test artifacts
+coverage/
+lcov.info
+
+# Reports and docs (not needed in image)
+*_REPORT.md
+*_GUIDE.md
+RELEASE_NOTES*.md
