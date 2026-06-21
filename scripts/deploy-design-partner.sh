@@ -25,9 +25,9 @@ for arg in "$@"; do
     esac
 done
 
-# Docker Compose command — runs with project directory set to workspace root
-# so build contexts and volume paths resolve correctly.
-DC="docker compose --project-directory $REPO_ROOT -f $COMPOSE_FILE"
+# Docker Compose command — compose file uses relative paths (../..) that resolve
+# correctly from the file's own directory; no --project-directory override needed.
+DC="docker compose -f $COMPOSE_FILE"
 
 # ── Colour helpers ─────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -261,6 +261,6 @@ $DC ps
 
 echo ""
 echo "  Logs:         docker logs omnisec-dp-daemon --tail 50"
-echo "  Stop:         docker compose --project-directory $REPO_ROOT -f $COMPOSE_FILE down"
-echo "  Restart:      docker compose --project-directory $REPO_ROOT -f $COMPOSE_FILE restart"
+echo "  Stop:         docker compose -f $COMPOSE_FILE down"
+echo "  Restart:      docker compose -f $COMPOSE_FILE restart"
 echo ""

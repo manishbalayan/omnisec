@@ -30,7 +30,7 @@ services:
       - "5432:5432"
     volumes:
       - omnisec_dp_postgres:/var/lib/postgresql/data
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ../../postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -66,7 +66,7 @@ services:
 
   daemon:
     build:
-      context: .
+      context: ../..
       dockerfile: services/daemon/Dockerfile
     container_name: omnisec-dp-daemon
     environment:
@@ -96,7 +96,7 @@ services:
 
   api:
     build:
-      context: .
+      context: ../..
       dockerfile: apps/api/Dockerfile
     container_name: omnisec-dp-api
     environment:
@@ -118,8 +118,8 @@ services:
 
   dashboard:
     build:
-      context: apps/dashboard
-      dockerfile: apps/dashboard/Dockerfile
+      context: ../../apps/dashboard
+      dockerfile: Dockerfile
     container_name: omnisec-dp-dashboard
     environment:
       NEXT_PUBLIC_API_URL: http://api:3000
