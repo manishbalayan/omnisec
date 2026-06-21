@@ -1,0 +1,135 @@
+# OMNISEC Design Partner Deployment
+# One-command startup: docker compose -f docker-compose.design-partner.yml up -d
+#
+# Includes:
+#   - Postgres (persistent storage)
+#   - NATS (event bus)
+#   - Redis (caching)
+#   - daemon (core orchestration with safe mode)
+#   - api (REST API)
+#   - dashboard (Next.js UI)
+#   - Sample policies pre-loaded
+#   - Sample dashboards pre-configured
+#   - Alert channel pre-configured (Telegram optional)
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: omnisec-dp-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: omnisec
+    ports:
+      - "5432:5432"
+    volumes:
+      - omnisec_dp_postgres:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: omnisec-dp-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+    restart: unless-stopped
+
+  nats:
+    image: nats:2-alpine
+    container_name: omnisec-dp-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js", "-sd", "/data"]
+    volumes:
+      - omnisec_dp_nats:/data
+    logging: *default-logging
+    restart: unless-stopped
+
+  daemon:
+    build:
+      context: .
+      dockerfile: services/daemon/Dockerfile
+    container_name: omnisec-dp-daemon
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/omnisec
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      OMNISEC_SAFE_MODE: "1"
+      OMNISEC_VERBOSE: "1"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      OMNISEC_API_KEY: ${OMNISEC_API_KEY:-dp-demo-key}
+    cap_add:
+      - SYS_PTRACE
+      - NET_ADMIN
+      - DAC_READ_SEARCH
+    volumes:
+      - /proc:/host/proc:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    logging: *default-logging
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: omnisec-dp-api
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/omnisec
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      OMNISEC_API_KEY: dp-demo-key
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    logging: *default-logging
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: apps/dashboard
+      dockerfile: apps/dashboard/Dockerfile
+    container_name: omnisec-dp-dashboard
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:3000
+    ports:
+      - "3002:3000"
+    depends_on:
+      - api
+    logging: *default-logging
+    restart: unless-stopped
+
+volumes:
+  omnisec_dp_postgres:
+  omnisec_dp_nats:

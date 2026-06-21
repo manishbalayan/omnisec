@@ -1,0 +1,5 @@
+-- Omnisec PostgreSQL init file
+-- The database 'omnisec' is created automatically by POSTGRES_DB env var.
+-- All schema (tables, indexes, types, extensions) is applied at runtime
+-- by sqlx migrations embedded in the omnisec-api and omnisec-daemon binaries.
+-- This file must exist for the postgres container volume mount to succeed.
