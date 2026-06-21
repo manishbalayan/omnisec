@@ -345,65 +345,67 @@ impl EbpfManager {
         let bpf_bytes = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/omnisec-ebpf-bpf"));
         let mut bpf = Ebpf::load(bpf_bytes)?;
 
+        // Helper: get a TracePoint program by name (program_mut returns Option in aya 0.13)
+        macro_rules! tracepoint {
+            ($bpf:expr, $name:expr) => {{
+                let p: &mut TracePoint = $bpf
+                    .program_mut($name)
+                    .ok_or_else(|| anyhow::anyhow!("program not found: {}", $name))?
+                    .try_into()?;
+                p
+            }};
+        }
+
         // --- Load tracepoint: sched_process_exec ---
-        let program: &mut TracePoint = bpf.program_mut("sched_process_exec")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sched_process_exec");
         program.load()?;
         program.attach("sched", "sched_process_exec")?;
         info!("Attached sched_process_exec tracepoint");
 
         // --- Load tracepoint: sched_process_exit ---
-        let program: &mut TracePoint = bpf.program_mut("sched_process_exit")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sched_process_exit");
         program.load()?;
         program.attach("sched", "sched_process_exit")?;
         info!("Attached sched_process_exit tracepoint");
 
         // --- Load tracepoint: sys_enter_clone ---
-        let program: &mut TracePoint = bpf.program_mut("sys_enter_clone")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sys_enter_clone");
         program.load()?;
         program.attach("syscalls", "sys_enter_clone")?;
         info!("Attached sys_enter_clone tracepoint");
 
         // --- Load tracepoint: sys_enter_connect ---
-        let program: &mut TracePoint = bpf.program_mut("sys_enter_connect")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sys_enter_connect");
         program.load()?;
         program.attach("syscalls", "sys_enter_connect")?;
         info!("Attached sys_enter_connect tracepoint");
 
         // --- Load tracepoint: sys_enter_bind ---
-        let program: &mut TracePoint = bpf.program_mut("sys_enter_bind")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sys_enter_bind");
         program.load()?;
         program.attach("syscalls", "sys_enter_bind")?;
         info!("Attached sys_enter_bind tracepoint");
 
         // --- Load tracepoint: sys_enter_accept4 ---
-        let program: &mut TracePoint = bpf.program_mut("sys_enter_accept4")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sys_enter_accept4");
         program.load()?;
         program.attach("syscalls", "sys_enter_accept4")?;
         info!("Attached sys_enter_accept4 tracepoint");
 
         // --- Load tracepoint: sys_enter_openat ---
-        let program: &mut TracePoint = bpf.program_mut("sys_enter_openat")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sys_enter_openat");
         program.load()?;
         program.attach("syscalls", "sys_enter_openat")?;
         info!("Attached sys_enter_openat tracepoint");
 
         // --- Load tracepoint: sys_enter_unlinkat ---
-        let program: &mut TracePoint = bpf.program_mut("sys_enter_unlinkat")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sys_enter_unlinkat");
         program.load()?;
         program.attach("syscalls", "sys_enter_unlinkat")?;
         info!("Attached sys_enter_unlinkat tracepoint");
 
         // --- Load tracepoint: sys_enter_sendto (DNS queries) ---
-        let program: &mut TracePoint = bpf.program_mut("sys_enter_sendto")?
-            .try_into()?;
+        let program = tracepoint!(bpf, "sys_enter_sendto");
         program.load()?;
         program.attach("syscalls", "sys_enter_sendto")?;
         info!("Attached sys_enter_sendto tracepoint (DNS port 53)");
@@ -531,7 +533,9 @@ impl EbpfManager {
         // Network events reader
         let net_ring_bufs = std::mem::take(&mut self.network_ring_bufs);
         let stats_clone = stats.clone();
+        let tx_net = tx.clone();
         tokio::spawn(async move {
+            let tx = tx_net;
             let mut bufs = net_ring_bufs;
             loop {
                 for buf in &mut bufs {
@@ -616,7 +620,9 @@ impl EbpfManager {
         let file_ring_bufs = std::mem::take(&mut self.file_ring_bufs);
         let stats_clone = stats.clone();
         let identity_clone = identity.clone();
+        let tx_file = tx.clone();
         tokio::spawn(async move {
+            let tx = tx_file;
             let mut bufs = file_ring_bufs;
             loop {
                 for buf in &mut bufs {
@@ -650,6 +656,9 @@ impl EbpfManager {
 
                         match event.event_type {
                             t if t == EVENT_FILE_ACCESS as u8 => {
+                                if sensitive_match {
+                                    warn!("SENSITIVE FILE ACCESS: PID {} accessed {}", event.pid, path);
+                                }
                                 let access_evt = FileAccessEvent {
                                     pid: event.pid,
                                     path,
@@ -663,9 +672,6 @@ impl EbpfManager {
                                 let mut s = stats_clone.write().await;
                                 s.events_total += 1;
                                 s.file_access_count += 1;
-                                if sensitive_match {
-                                    warn!("SENSITIVE FILE ACCESS: PID {} accessed {}", event.pid, path);
-                                }
                             }
                             t if t == EVENT_FILE_DELETE as u8 => {
                                 let del_evt = FileDeleteEvent {
