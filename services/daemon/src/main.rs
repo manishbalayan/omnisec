@@ -647,8 +647,16 @@ async fn main() -> Result<()> {
             while let Some((subject, envelope)) = all_sub.next().await {
                 let summary = format!("{} event from {}", subject, envelope.source);
 
+                // Strip the "omnisec." namespace prefix before storing as event_type,
+                // so "omnisec.agent_discovered" → "agent_discovered" (cleaner audit log).
+                // Nested subjects like "omnisec.security.anomaly_detected" become
+                // "security_anomaly_detected" after the remaining dots are replaced.
+                let event_type = subject
+                    .trim_start_matches("omnisec.")
+                    .replace('.', "_");
+
                 if let Err(e) = storage
-                    .create_event(None, &subject.replace('.', "_"), "info", &summary)
+                    .create_event(None, &event_type, "info", &summary)
                     .await
                 {
                     tracing::error!("Failed to persist audit event for {}: {}", subject, e);
